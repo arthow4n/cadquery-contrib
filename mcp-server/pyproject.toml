@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cadquery-mcp"
+version = "0.1.0"
+description = "MCP (Model Context Protocol) server for CadQuery - enables AI assistants to create 3D CAD models"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "CadQuery Development Team"},
+]
+maintainers = [
+    {name = "Albert Wang", email = "amwang217@gmail.com"},
+]
+keywords = ["cadquery", "cad", "mcp", "ai", "claude", "3d-modeling"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "cadquery>=2.4.0",
+    "mcp>=1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/CadQuery/cadquery-contrib"
+Repository = "https://github.com/CadQuery/cadquery-contrib"
+Documentation = "https://github.com/CadQuery/cadquery-contrib/tree/master/mcp-server"
+
+[project.scripts]
+cadquery-mcp = "cadquery_mcp_server:run"
+
+[tool.setuptools]
+py-modules = ["cadquery_mcp_server"]

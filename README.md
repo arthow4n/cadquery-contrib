@@ -3,6 +3,14 @@ A place to share CadQuery scripts, modules, tutorials and projects
 
 ## Contents
 
+### Tools
+
+* [MCP Server](mcp-server/) - Model Context Protocol server for AI assistants (Claude, etc.) to execute CadQuery scripts and render 3D models. Enables natural language CAD modeling.
+
+  ```bash
+  cd mcp-server && pip install .
+  ```
+
 ### Examples
 
 * [Braille.py](examples/Braille.py) - Configurable braille label/sign generator where user inputs text and the braille dots are generated automatically
@@ -59,8 +67,8 @@ A place to share CadQuery scripts, modules, tutorials and projects
 
 * [Involute_Gear.py](examples/Involute_Gear.py) - Fast involute gear generator.
 
-    <img src="examples/images/Involute_Gear.png" width="600"/>   
-  
+    <img src="examples/images/Involute_Gear.png" width="600"/>
+
 * [Thread.py](examples/Thread.py) - Thread example.
 
     <img src="examples/images/Thread.png" width="600"/>
@@ -69,7 +77,7 @@ A place to share CadQuery scripts, modules, tutorials and projects
 
     <img src="examples/hexagonal_drawers/hmd.png" width="600"/>
     <img src="examples/hexagonal_drawers/hmd.jpg" width="600"/>
-    
+
 * [Digital sundial](https://github.com/lopezsolerluis/reloj-de-sol-digital-cadquery) - Inspired by [Mojoptix's digital sundial](https://www.thingiverse.com/thing:1068443) and derived from [my own version](https://github.com/lopezsolerluis/reloj-de-sol-digital) in OpenSCAD.
 
     <img src="https://github.com/lopezsolerluis/reloj-de-sol-digital-cadquery/blob/main/sundial-cadquery.png" width="600"/>
@@ -90,4 +98,3 @@ A place to share CadQuery scripts, modules, tutorials and projects
 
 * [Ex000 Start Here.ipynb](tutorials/Ex000%20Start%20Here.ipynb) - iPython notebook that is the entry point for a set of CadQuery tutorials
 * [Ex001 Simple Block.ipynb](tutorials/Ex001%20Simple%20Block.ipynb) - iPython notebook that shows how to create an extremely simple block
-

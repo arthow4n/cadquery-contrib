@@ -522,8 +522,68 @@ result = cq.Workplane("XY").box(width, height, depth)
 
         for image in result[1:]:
             assert image.type == "image"
-            assert image.mimeType == "image/svg+xml"
-            assert "<svg" in base64.b64decode(image.data).decode("utf-8")
+            assert image.mimeType == "image/png"
+            assert base64.b64decode(image.data).startswith(b"\x89PNG\r\n\x1a\n")
+
+    def test_evaluate_file_can_return_svg(self):
+        from cadquery_mcp_server import _handle_evaluate_file
+
+        filename = self._write_model(
+            'import cadquery as cq\nresult = cq.Workplane("XY").box(1, 2, 3)\n'
+        )
+        try:
+            result = asyncio.run(_handle_evaluate_file({
+                "file_path": filename,
+                "views": ["front"],
+                "image_format": "svg",
+            }))
+        finally:
+            os.unlink(filename)
+
+        assert len(result) == 2
+        assert result[1].mimeType == "image/svg+xml"
+        assert "<svg" in base64.b64decode(result[1].data).decode("utf-8")
+
+    def test_evaluate_file_saves_views_instead_of_returning_images(self):
+        from cadquery_mcp_server import _handle_evaluate_file
+
+        filename = self._write_model(
+            'import cadquery as cq\nresult = cq.Workplane("XY").box(1, 2, 3)\n'
+        )
+        with tempfile.TemporaryDirectory() as output_dir:
+            try:
+                result = asyncio.run(_handle_evaluate_file({
+                    "file_path": filename,
+                    "views": ["front", "top"],
+                    "output_dir": output_dir,
+                }))
+            finally:
+                os.unlink(filename)
+
+            stem = os.path.splitext(os.path.basename(filename))[0]
+            saved_paths = [
+                os.path.join(output_dir, f"{stem}_front.png"),
+                os.path.join(output_dir, f"{stem}_top.png"),
+            ]
+            assert len(result) == 1
+            assert "Saved views:" in result[0].text
+            assert all(os.path.exists(path) for path in saved_paths)
+            for path in saved_paths:
+                with open(path, "rb") as image_file:
+                    assert image_file.read(8) == b"\x89PNG\r\n\x1a\n"
+
+    def test_evaluate_file_schema_uses_png_by_default(self):
+        import cadquery_mcp_server
+
+        tool = next(
+            tool for tool in asyncio.run(cadquery_mcp_server.list_tools())
+            if tool.name == "evaluate_file"
+        )
+        schema = tool.model_dump(by_alias=True)["inputSchema"]
+
+        assert schema["properties"]["image_format"]["default"] == "png"
+        assert schema["properties"]["image_format"]["enum"] == ["png", "svg"]
+        assert "output_dir" in schema["properties"]
 
     def test_evaluate_file_reports_invalid_source(self):
         from cadquery_mcp_server import _handle_evaluate_file

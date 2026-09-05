@@ -38,8 +38,11 @@ Configuration in Claude Code (~/.claude/settings.json):
 import argparse
 import asyncio
 import base64
+import shutil
+import subprocess
 import tempfile
 import traceback
+from pathlib import Path
 from typing import Any
 
 from mcp.server import Server
@@ -189,7 +192,8 @@ async def list_tools() -> list[Tool]:
             name="evaluate_file",
             description=(
                 "Read, build, and evaluate a CadQuery Python file once. Returns geometry information, "
-                "parameters, and SVG renders for the requested views."
+                "parameters, and PNG or SVG renders for the requested views. PNG is returned by default; "
+                "provide output_dir to save the rendered files there instead of returning image content."
             ),
             inputSchema={
                 "type": "object",
@@ -221,6 +225,16 @@ async def list_tools() -> list[Tool]:
                         "type": "boolean",
                         "default": True,
                         "description": "Whether to show hidden lines",
+                    },
+                    "image_format": {
+                        "type": "string",
+                        "enum": ["png", "svg"],
+                        "default": "png",
+                        "description": "Image format for returned or saved views",
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Optional directory for saved views; when set, image content is not returned and matching files are replaced",
                     },
                 },
                 "required": ["file_path"],
@@ -264,6 +278,43 @@ def _render_svg(shape, view_name: str, width: int, height: int, show_hidden: boo
     }
 
     return getSVG(shape, opts=opts)
+
+
+def _render_png(svg_content: str) -> bytes:
+    """Rasterize generated SVG content without adding a Python dependency."""
+    converter = shutil.which("magick") or shutil.which("convert")
+    if converter is None:
+        raise RuntimeError("PNG rendering requires ImageMagick ('magick' or 'convert') on PATH")
+
+    try:
+        result = subprocess.run(
+            [converter, "svg:-", "png:-"],
+            input=svg_content.encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        detail = e.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ImageMagick failed to render PNG: {detail}") from e
+    return result.stdout
+
+
+def _render_image(
+    shape,
+    view_name: str,
+    width: int,
+    height: int,
+    show_hidden: bool,
+    image_format: str,
+) -> tuple[bytes, str]:
+    """Render one view in the requested format."""
+    svg_content = _render_svg(shape, view_name, width, height, show_hidden)
+    if image_format == "svg":
+        return svg_content.encode("utf-8"), "image/svg+xml"
+    if image_format == "png":
+        return _render_png(svg_content), "image/png"
+    raise ValueError(f"Unsupported image format: {image_format}")
 
 
 def _geometry_summary(shape, build_time: float) -> str:
@@ -511,31 +562,64 @@ async def _handle_evaluate_file(arguments: dict[str, Any]) -> list[TextContent |
     views = arguments.get("views", list(_EVALUATE_FILE_DEFAULT_VIEWS))
     if views is None:
         views = []
+    if not isinstance(views, list) or not all(isinstance(view, str) for view in views):
+        return [TextContent(type="text", text="views must be an array of view names.")]
 
-    summary = "\n\n".join((
-        f"File: {file_path}",
-        _geometry_summary(shape, result.buildTime),
-        _parameter_summary(model.metadata.parameters, heading="Parameters:"),
-        f"Rendered views: {', '.join(views) if views else 'none'}",
-    ))
-    results: list[TextContent | ImageContent] = [TextContent(type="text", text=summary)]
+    image_format = arguments.get("image_format", "png")
+    if image_format not in ("png", "svg"):
+        return [TextContent(type="text", text="image_format must be 'png' or 'svg'.")]
 
+    output_dir = arguments.get("output_dir")
+    if output_dir is not None and (not isinstance(output_dir, str) or not output_dir):
+        return [TextContent(type="text", text="output_dir must be a non-empty directory path.")]
+
+    rendered_views = []
     try:
         for view_name in views:
-            svg_content = _render_svg(
+            image_data, mime_type = _render_image(
                 shape,
                 view_name,
                 arguments.get("width", 800),
                 arguments.get("height", 600),
                 arguments.get("show_hidden", True),
+                image_format,
             )
-            svg_data = base64.standard_b64encode(svg_content.encode("utf-8")).decode("utf-8")
-            results.append(_CadQueryImageContent(type="image", data=svg_data, mimeType="image/svg+xml"))
+            rendered_views.append((view_name, image_data, mime_type))
     except Exception as e:
         return [TextContent(
             type="text",
             text=f"Unable to render view '{view_name}' for '{file_path}': {type(e).__name__}: {e}",
         )]
+
+    summary = "\n\n".join((
+        f"File: {file_path}",
+        _geometry_summary(shape, result.buildTime),
+        _parameter_summary(model.metadata.parameters, heading="Parameters:"),
+        f"Rendered views ({image_format}): {', '.join(views) if views else 'none'}",
+    ))
+
+    if output_dir is not None:
+        output_path = Path(output_dir)
+        try:
+            output_path.mkdir(parents=True, exist_ok=True)
+            saved_paths = []
+            stem = Path(file_path).stem or "model"
+            for view_name, image_data, _mime_type in rendered_views:
+                saved_path = output_path / f"{stem}_{view_name}.{image_format}"
+                saved_path.write_bytes(image_data)
+                saved_paths.append(str(saved_path))
+        except OSError as e:
+            return [TextContent(type="text", text=f"Unable to save views to '{output_dir}': {e}")]
+
+        saved_summary = "Saved views:\n" + (
+            "\n".join(f"  {path}" for path in saved_paths) if saved_paths else "  none"
+        )
+        return [TextContent(type="text", text=f"{summary}\n\n{saved_summary}")]
+
+    results: list[TextContent | ImageContent] = [TextContent(type="text", text=summary)]
+    for _view_name, image_data, mime_type in rendered_views:
+        image_data_base64 = base64.standard_b64encode(image_data).decode("utf-8")
+        results.append(_CadQueryImageContent(type="image", data=image_data_base64, mimeType=mime_type))
 
     return results
 

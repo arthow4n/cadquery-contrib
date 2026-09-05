@@ -21,7 +21,7 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that 
 - **export** - Export models to various formats
   - STEP, STL, SVG, DXF, AMF, 3MF, VRML, BREP
 
-- **evaluate_file** - Build a CadQuery file once and return geometry, parameters, and SVG views
+- **evaluate_file** - Build a CadQuery file once and return geometry, parameters, and PNG or SVG views
 
 ## Installation
 
@@ -109,7 +109,7 @@ models/bracket.py
         ↓
 evaluate_file
         ↓
-geometry + parameters + SVG views
+geometry + parameters + PNG/SVG views
         ↓
 edit bracket.py
         ↓
@@ -128,6 +128,8 @@ Example MCP configuration:
     }
 }
 ```
+
+PNG is the default image format for reliable model vision. PNG conversion requires ImageMagick (`magick` or `convert`) on `PATH`; use `image_format: "svg"` when SVG output is preferred. If `output_dir` is provided to `evaluate_file`, the requested images are saved there and the tool returns their paths in the text summary instead of inline image content.
 
 ## Usage Examples
 
@@ -223,7 +225,7 @@ Export the model to a file.
 
 ### evaluate_file
 
-Build a CadQuery Python file once and return a text summary followed by one SVG image per requested view.
+Build a CadQuery Python file once and return a text summary followed by one PNG or SVG image per requested view. When `output_dir` is provided, save the images there and return their paths instead.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -232,6 +234,8 @@ Build a CadQuery Python file once and return a text summary followed by one SVG 
 | width | integer | 800 | Image width in pixels |
 | height | integer | 600 | Image height in pixels |
 | show_hidden | boolean | true | Show hidden lines |
+| image_format | string | png | Image format: png or svg |
+| output_dir | string | omitted | Optional directory for saved images; suppresses inline image content |
 
 ## Writing CadQuery Scripts for MCP
 

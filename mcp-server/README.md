@@ -21,6 +21,8 @@ An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that 
 - **export** - Export models to various formats
   - STEP, STL, SVG, DXF, AMF, 3MF, VRML, BREP
 
+- **evaluate_file** - Build a CadQuery file once and return geometry, parameters, and SVG views
+
 ## Installation
 
 ### Prerequisites
@@ -89,6 +91,39 @@ Add to your Claude Desktop configuration (`~/Library/Application Support/Claude/
     "mcpServers": {
         "cadquery": {
             "command": "/path/to/conda/envs/yourenv/bin/cadquery-mcp"
+        }
+    }
+}
+```
+
+### File-based evaluation
+
+For an agent workflow where the model file is edited between evaluations, run the reduced toolset:
+
+```bash
+cadquery-mcp --toolset evaluate-file
+```
+
+```text
+models/bracket.py
+        ↓
+evaluate_file
+        ↓
+geometry + parameters + SVG views
+        ↓
+edit bracket.py
+        ↓
+evaluate again
+```
+
+Example MCP configuration:
+
+```json
+{
+    "mcpServers": {
+        "cadquery": {
+            "command": "cadquery-mcp",
+            "args": ["--toolset", "evaluate-file"]
         }
     }
 }
@@ -185,6 +220,18 @@ Export the model to a file.
 | code | string | required | CadQuery Python code to execute |
 | filename | string | required | Output filename |
 | format | string | auto | Export format (STEP, STL, SVG, DXF, AMF, 3MF, VRML, BREP) |
+
+### evaluate_file
+
+Build a CadQuery Python file once and return a text summary followed by one SVG image per requested view.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| file_path | string | required | Path to the CadQuery Python source file |
+| views | array of strings | isometric, front, top, right | Views to render |
+| width | integer | 800 | Image width in pixels |
+| height | integer | 600 | Image height in pixels |
+| show_hidden | boolean | true | Show hidden lines |
 
 ## Writing CadQuery Scripts for MCP
 

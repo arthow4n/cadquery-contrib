@@ -454,3 +454,140 @@ result = cq.Workplane('XY').box(20, 20, 10).faces('>Z').workplane().hole(5)
             assert view in VIEWS
             # Each view should be a 3-tuple (projection direction)
             assert len(VIEWS[view]) == 3
+
+
+class TestEvaluateFile:
+    """Tests for the file-based evaluation workflow."""
+
+    def _write_model(self, source):
+        file_descriptor, filename = tempfile.mkstemp(suffix=".py")
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as model_file:
+            model_file.write(source)
+        return filename
+
+    def test_evaluate_file_builds_once_with_geometry_parameters_and_views(self, monkeypatch):
+        import cadquery_mcp_server
+        from cadquery_mcp_server import _handle_evaluate_file
+
+        filename = self._write_model("""
+width = 20.0
+height = 10.0
+depth = 5.0
+
+import cadquery as cq
+result = cq.Workplane("XY").box(width, height, depth)
+""")
+        build_count = 0
+        original_parse = cadquery_mcp_server.cqgi.parse
+
+        def parse_once(source):
+            model = original_parse(source)
+            original_build = model.build
+
+            def build_once():
+                nonlocal build_count
+                build_count += 1
+                return original_build()
+
+            model.build = build_once
+            return model
+
+        monkeypatch.setattr(cadquery_mcp_server.cqgi, "parse", parse_once)
+        try:
+            result = asyncio.run(_handle_evaluate_file({"file_path": filename}))
+        finally:
+            os.unlink(filename)
+
+        assert build_count == 1
+        assert len(result) == 5
+        assert result[0].type == "text"
+
+        summary = result[0].text
+        assert "Geometry Information" in summary
+        assert "size: 20.0000" in summary
+        assert "size: 10.0000" in summary
+        assert "size: 5.0000" in summary
+        assert "Volume: 1000.0000" in summary
+        assert "Surface Area" in summary
+        assert "Center of Mass" in summary
+        assert "Solids: 1" in summary
+        assert "Faces: 6" in summary
+        assert "Edges: 12" in summary
+        assert "Vertices: 8" in summary
+        assert "Build Time" in summary
+        assert "Parameters:" in summary
+        assert "width: NumberParameterType = 20.0" in summary
+        assert "height: NumberParameterType = 10.0" in summary
+        assert "depth: NumberParameterType = 5.0" in summary
+
+        for image in result[1:]:
+            assert image.type == "image"
+            assert image.mimeType == "image/svg+xml"
+            assert "<svg" in base64.b64decode(image.data).decode("utf-8")
+
+    def test_evaluate_file_reports_invalid_source(self):
+        from cadquery_mcp_server import _handle_evaluate_file
+
+        filename = self._write_model("this is not valid Python!!!")
+        try:
+            result = asyncio.run(_handle_evaluate_file({"file_path": filename}))
+        finally:
+            os.unlink(filename)
+
+        assert result[0].type == "text"
+        assert "Syntax error" in result[0].text
+        assert filename in result[0].text
+
+    def test_evaluate_file_reports_build_failure(self):
+        from cadquery_mcp_server import _handle_evaluate_file
+
+        filename = self._write_model("raise RuntimeError('broken model')")
+        try:
+            result = asyncio.run(_handle_evaluate_file({"file_path": filename}))
+        finally:
+            os.unlink(filename)
+
+        assert result[0].type == "text"
+        assert "Build failed" in result[0].text
+        assert "broken model" in result[0].text
+
+    def test_evaluate_file_reports_missing_file(self):
+        from cadquery_mcp_server import _handle_evaluate_file
+
+        with tempfile.TemporaryDirectory() as directory:
+            filename = os.path.join(directory, "missing.py")
+            result = asyncio.run(_handle_evaluate_file({"file_path": filename}))
+
+        assert result[0].type == "text"
+        assert "File not found" in result[0].text
+        assert filename in result[0].text
+
+
+class TestToolsets:
+    """Tests for selecting the MCP tool surface from the CLI."""
+
+    def test_all_toolset_exposes_all_tools(self, monkeypatch):
+        import cadquery_mcp_server
+
+        monkeypatch.setattr(cadquery_mcp_server, "_TOOLSET", "all")
+        names = [tool.name for tool in asyncio.run(cadquery_mcp_server.list_tools())]
+
+        assert names == ["render", "inspect", "get_parameters", "export", "evaluate_file"]
+
+    def test_evaluate_file_toolset_exposes_only_evaluate_file(self, monkeypatch):
+        import cadquery_mcp_server
+
+        monkeypatch.setattr(cadquery_mcp_server, "_TOOLSET", "evaluate-file")
+        names = [tool.name for tool in asyncio.run(cadquery_mcp_server.list_tools())]
+
+        assert names == ["evaluate_file"]
+        assert cadquery_mcp_server._parse_args([]).toolset == "all"
+        assert cadquery_mcp_server._parse_args(["--toolset", "evaluate-file"]).toolset == "evaluate-file"
+
+    def test_disabled_tools_are_not_dispatched(self, monkeypatch):
+        import cadquery_mcp_server
+
+        monkeypatch.setattr(cadquery_mcp_server, "_TOOLSET", "evaluate-file")
+        result = asyncio.run(cadquery_mcp_server.call_tool("inspect", {"code": ""}))
+
+        assert "not enabled" in result[0].text

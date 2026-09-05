@@ -35,6 +35,7 @@ Configuration in Claude Code (~/.claude/settings.json):
     }
 """
 
+import argparse
 import asyncio
 import base64
 import tempfile
@@ -71,10 +72,13 @@ VIEWS = {
     "isometric_back": (1.75, -1.1, 5),  # Isometric from opposite corner
 }
 
+_TOOLSET = "all"
+_EVALUATE_FILE_DEFAULT_VIEWS = ("isometric", "front", "top", "right")
+
 
 async def list_tools() -> list[Tool]:
     """List available CadQuery tools."""
-    return [
+    tools = [
         Tool(
             name="render",
             description=(
@@ -181,7 +185,52 @@ async def list_tools() -> list[Tool]:
                 "required": ["code", "filename"],
             },
         ),
+        Tool(
+            name="evaluate_file",
+            description=(
+                "Read, build, and evaluate a CadQuery Python file once. Returns geometry information, "
+                "parameters, and SVG renders for the requested views."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the CadQuery Python source file",
+                    },
+                    "views": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": list(VIEWS),
+                        },
+                        "default": list(_EVALUATE_FILE_DEFAULT_VIEWS),
+                        "description": "Views to render",
+                    },
+                    "width": {
+                        "type": "integer",
+                        "default": 800,
+                        "description": "Image width in pixels",
+                    },
+                    "height": {
+                        "type": "integer",
+                        "default": 600,
+                        "description": "Image height in pixels",
+                    },
+                    "show_hidden": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "Whether to show hidden lines",
+                    },
+                },
+                "required": ["file_path"],
+            },
+        ),
     ]
+
+    if _TOOLSET == "evaluate-file":
+        return [tool for tool in tools if tool.name == "evaluate_file"]
+    return tools
 
 
 async def _list_tools_handler(_context, _params) -> ListToolsResult:
@@ -217,8 +266,70 @@ def _render_svg(shape, view_name: str, width: int, height: int, show_hidden: boo
     return getSVG(shape, opts=opts)
 
 
+def _geometry_summary(shape, build_time: float) -> str:
+    """Return the geometry information shared by inspect and evaluate_file."""
+    bb = shape.BoundingBox()
+    info_lines = [
+        "Geometry Information:",
+        "  Bounding Box:",
+        f"    X: {bb.xmin:.4f} to {bb.xmax:.4f} (size: {bb.xlen:.4f})",
+        f"    Y: {bb.ymin:.4f} to {bb.ymax:.4f} (size: {bb.ylen:.4f})",
+        f"    Z: {bb.zmin:.4f} to {bb.zmax:.4f} (size: {bb.zlen:.4f})",
+    ]
+
+    try:
+        info_lines.append(f"  Volume: {shape.Volume():.4f}")
+    except Exception:
+        pass
+
+    try:
+        info_lines.append(f"  Surface Area: {shape.Area():.4f}")
+    except Exception:
+        pass
+
+    try:
+        center = shape.Center()
+        info_lines.append(f"  Center of Mass: ({center.x:.4f}, {center.y:.4f}, {center.z:.4f})")
+    except Exception:
+        pass
+
+    info_lines.append("  Topology:")
+    for name, method in (
+        ("Solids", shape.Solids),
+        ("Faces", shape.Faces),
+        ("Edges", shape.Edges),
+        ("Vertices", shape.Vertices),
+    ):
+        try:
+            info_lines.append(f"    {name}: {len(method())}")
+        except Exception:
+            pass
+
+    info_lines.append(f"  Build Time: {build_time:.4f}s")
+    return "\n".join(info_lines)
+
+
+def _parameter_summary(params, heading: str = "Parameters found:") -> str:
+    """Format CQGI parameter metadata for an MCP text result."""
+    if not params:
+        return "No parameters found in the script."
+
+    lines = [heading]
+    for name, param in params.items():
+        type_name = param.varType.__name__ if param.varType else "unknown"
+        lines.append(f"  {name}: {type_name} = {param.default_value}")
+        if param.desc:
+            lines.append(f"    Description: {param.desc}")
+        if param.valid_values:
+            lines.append(f"    Valid values: {param.valid_values}")
+    return "\n".join(lines)
+
+
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
     """Handle tool calls."""
+
+    if _TOOLSET == "evaluate-file" and name != "evaluate_file":
+        return [TextContent(type="text", text=f"Tool not enabled in the current toolset: {name}")]
 
     if name == "render":
         return await _handle_render(arguments)
@@ -228,6 +339,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
         return await _handle_get_parameters(arguments)
     elif name == "export":
         return await _handle_export(arguments)
+    elif name == "evaluate_file":
+        return await _handle_evaluate_file(arguments)
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -331,50 +444,7 @@ async def _handle_inspect(arguments: dict[str, Any]) -> list[TextContent | Image
         if hasattr(shape, "val"):
             shape = shape.val()
 
-        # Gather geometry information
-        bb = shape.BoundingBox()
-        info_lines = [
-            "Geometry Information:",
-            f"  Bounding Box:",
-            f"    X: {bb.xmin:.4f} to {bb.xmax:.4f} (size: {bb.xlen:.4f})",
-            f"    Y: {bb.ymin:.4f} to {bb.ymax:.4f} (size: {bb.ylen:.4f})",
-            f"    Z: {bb.zmin:.4f} to {bb.zmax:.4f} (size: {bb.zlen:.4f})",
-        ]
-
-        # Try to get volume (only works for solids)
-        try:
-            volume = shape.Volume()
-            info_lines.append(f"  Volume: {volume:.4f}")
-        except Exception:
-            pass
-
-        # Try to get surface area
-        try:
-            area = shape.Area()
-            info_lines.append(f"  Surface Area: {area:.4f}")
-        except Exception:
-            pass
-
-        # Try to get center of mass
-        try:
-            com = shape.Center()
-            info_lines.append(f"  Center of Mass: ({com.x:.4f}, {com.y:.4f}, {com.z:.4f})")
-        except Exception:
-            pass
-
-        # Count topological entities
-        try:
-            info_lines.append(f"  Topology:")
-            info_lines.append(f"    Solids: {len(shape.Solids())}")
-            info_lines.append(f"    Faces: {len(shape.Faces())}")
-            info_lines.append(f"    Edges: {len(shape.Edges())}")
-            info_lines.append(f"    Vertices: {len(shape.Vertices())}")
-        except Exception:
-            pass
-
-        info_lines.append(f"  Build Time: {result.buildTime:.4f}s")
-
-        return [TextContent(type="text", text="\n".join(info_lines))]
+        return [TextContent(type="text", text=_geometry_summary(shape, result.buildTime))]
 
     except Exception as e:
         return [TextContent(type="text", text=f"Error: {type(e).__name__}: {e}")]
@@ -391,21 +461,83 @@ async def _handle_get_parameters(arguments: dict[str, Any]) -> list[TextContent 
         if not params:
             return [TextContent(type="text", text="No parameters found in the script.")]
 
-        lines = ["Parameters found:"]
-        for name, param in params.items():
-            type_name = param.varType.__name__ if param.varType else "unknown"
-            lines.append(f"  {name}: {type_name} = {param.default_value}")
-            if param.desc:
-                lines.append(f"    Description: {param.desc}")
-            if param.valid_values:
-                lines.append(f"    Valid values: {param.valid_values}")
-
-        return [TextContent(type="text", text="\n".join(lines))]
+        return [TextContent(type="text", text=_parameter_summary(params))]
 
     except SyntaxError as e:
         return [TextContent(type="text", text=f"Syntax error: {e}")]
     except Exception as e:
         return [TextContent(type="text", text=f"Error: {type(e).__name__}: {e}")]
+
+
+async def _handle_evaluate_file(arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
+    """Build a CadQuery file once and return its geometry, parameters, and views."""
+    file_path = arguments.get("file_path")
+    if not isinstance(file_path, str) or not file_path:
+        return [TextContent(type="text", text="File path is required.")]
+
+    try:
+        with open(file_path, encoding="utf-8") as source_file:
+            code = source_file.read()
+    except FileNotFoundError:
+        return [TextContent(type="text", text=f"File not found: {file_path}")]
+    except (OSError, UnicodeError) as e:
+        return [TextContent(type="text", text=f"Unable to read file '{file_path}': {e}")]
+
+    try:
+        model = cqgi.parse(code)
+    except SyntaxError as e:
+        return [TextContent(type="text", text=f"Syntax error in '{file_path}': {e}")]
+    except Exception as e:
+        return [TextContent(type="text", text=f"Unable to parse '{file_path}': {type(e).__name__}: {e}")]
+
+    try:
+        result = model.build()
+    except Exception as e:
+        return [TextContent(type="text", text=f"Build failed for '{file_path}': {type(e).__name__}: {e}")]
+
+    if result.exception:
+        return [TextContent(type="text", text=f"Build failed for '{file_path}': {result.exception}")]
+
+    shape = _extract_shape(result, getattr(result, "env", {}))
+    if shape is None:
+        return [TextContent(
+            type="text",
+            text=f"No shape produced by '{file_path}'. Use show_object(shape) or assign to 'result'.",
+        )]
+
+    if hasattr(shape, "val"):
+        shape = shape.val()
+
+    views = arguments.get("views", list(_EVALUATE_FILE_DEFAULT_VIEWS))
+    if views is None:
+        views = []
+
+    summary = "\n\n".join((
+        f"File: {file_path}",
+        _geometry_summary(shape, result.buildTime),
+        _parameter_summary(model.metadata.parameters, heading="Parameters:"),
+        f"Rendered views: {', '.join(views) if views else 'none'}",
+    ))
+    results: list[TextContent | ImageContent] = [TextContent(type="text", text=summary)]
+
+    try:
+        for view_name in views:
+            svg_content = _render_svg(
+                shape,
+                view_name,
+                arguments.get("width", 800),
+                arguments.get("height", 600),
+                arguments.get("show_hidden", True),
+            )
+            svg_data = base64.standard_b64encode(svg_content.encode("utf-8")).decode("utf-8")
+            results.append(_CadQueryImageContent(type="image", data=svg_data, mimeType="image/svg+xml"))
+    except Exception as e:
+        return [TextContent(
+            type="text",
+            text=f"Unable to render view '{view_name}' for '{file_path}': {type(e).__name__}: {e}",
+        )]
+
+    return results
 
 
 async def _handle_export(arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
@@ -455,8 +587,21 @@ async def main():
         )
 
 
+def _parse_args(args=None):
+    parser = argparse.ArgumentParser(description="Run the CadQuery MCP server")
+    parser.add_argument(
+        "--toolset",
+        choices=("all", "evaluate-file"),
+        default="all",
+        help="Toolset to expose (default: all)",
+    )
+    return parser.parse_args(args)
+
+
 def run():
     """Entry point for the cadquery-mcp command."""
+    global _TOOLSET
+    _TOOLSET = _parse_args().toolset
     asyncio.run(main())
 
 

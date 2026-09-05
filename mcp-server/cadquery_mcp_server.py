@@ -43,7 +43,7 @@ from typing import Any
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent, ImageContent
+from mcp.types import CallToolRequestParams, CallToolResult, ListToolsResult, Tool, TextContent, ImageContent
 
 import cadquery as cq
 from cadquery import cqgi
@@ -51,7 +51,13 @@ from cadquery.occ_impl.exporters.svg import getSVG
 from cadquery.occ_impl.exporters import export
 
 
-server = Server("cadquery")
+class _CadQueryImageContent(ImageContent):
+    """Image content with the pre-MCP-2 Python attribute name retained."""
+
+    @property
+    def mimeType(self) -> str:
+        return self.mime_type
+
 
 # Standard view projection directions
 VIEWS = {
@@ -66,7 +72,6 @@ VIEWS = {
 }
 
 
-@server.list_tools()
 async def list_tools() -> list[Tool]:
     """List available CadQuery tools."""
     return [
@@ -179,6 +184,11 @@ async def list_tools() -> list[Tool]:
     ]
 
 
+async def _list_tools_handler(_context, _params) -> ListToolsResult:
+    """Adapt the public tool list to the low-level MCP server API."""
+    return ListToolsResult(tools=await list_tools())
+
+
 def _extract_shape(build_result, env):
     """Extract the shape from a build result or environment."""
     # First try to get from show_object() calls
@@ -207,7 +217,6 @@ def _render_svg(shape, view_name: str, width: int, height: int, show_hidden: boo
     return getSVG(shape, opts=opts)
 
 
-@server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
     """Handle tool calls."""
 
@@ -221,6 +230,19 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
         return await _handle_export(arguments)
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
+
+
+async def _call_tool_handler(_context, params: CallToolRequestParams):
+    """Adapt the public tool caller to the low-level MCP server API."""
+    content = await call_tool(params.name, params.arguments or {})
+    return CallToolResult(content=content)
+
+
+server = Server(
+    "cadquery",
+    on_list_tools=_list_tools_handler,
+    on_call_tool=_call_tool_handler,
+)
 
 
 async def _handle_render(arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
@@ -263,7 +285,7 @@ async def _handle_render(arguments: dict[str, Any]) -> list[TextContent | ImageC
             for view_name in views_to_render:
                 svg_content = _render_svg(shape, view_name, width, height, show_hidden)
                 svg_data = base64.standard_b64encode(svg_content.encode("utf-8")).decode("utf-8")
-                results.append(ImageContent(type="image", data=svg_data, mimeType="image/svg+xml"))
+                results.append(_CadQueryImageContent(type="image", data=svg_data, mimeType="image/svg+xml"))
 
             # Add a text description of the views
             results.insert(0, TextContent(
@@ -275,7 +297,7 @@ async def _handle_render(arguments: dict[str, Any]) -> list[TextContent | ImageC
             # Single view
             svg_content = _render_svg(shape, view, width, height, show_hidden)
             svg_data = base64.standard_b64encode(svg_content.encode("utf-8")).decode("utf-8")
-            return [ImageContent(type="image", data=svg_data, mimeType="image/svg+xml")]
+            return [_CadQueryImageContent(type="image", data=svg_data, mimeType="image/svg+xml")]
 
     except SyntaxError as e:
         return [TextContent(type="text", text=f"Syntax error: {e}")]

@@ -277,7 +277,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "cadquery", specifier = ">=2.4.0" },
-    { name = "mcp", specifier = ">=1.0.0" },
+    { name = "mcp", specifier = ">=2.0.0" },
 ]
 
 [[package]]

@@ -1,261 +1,144 @@
-# CadQuery MCP Server
+# CadQuery MCP server
 
-An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that enables AI assistants like Claude to execute CadQuery scripts and render 3D CAD models.
+The customized branch provides `evaluate_file`: build a CadQuery file once,
+inspect its geometry and parameters, optionally export STEP/STL, and render views.
+Each evaluation runs in a fresh worker process. The legacy `render`, `inspect`,
+`get_parameters` and `export` tools remain available in the default full toolset.
 
-## Features
+## Setup
 
-- **render** - Execute CadQuery code and return SVG images of the 3D model
-  - Multiple camera angles: isometric, front, back, top, bottom, left, right
-  - Multi-view mode for complex models
-  - Configurable image dimensions
-  - Hidden line rendering
+From this checkout's `mcp-server/` directory:
 
-- **inspect** - Get geometry information about a shape
-  - Bounding box dimensions
-  - Volume and surface area
-  - Center of mass
-  - Topology counts (solids, faces, edges, vertices)
-
-- **get_parameters** - Extract customizable parameters from CadQuery scripts
-
-- **export** - Export models to various formats
-  - STEP, STL, SVG, DXF, AMF, 3MF, VRML, BREP
-
-- **evaluate_file** - Build a CadQuery file once and return geometry, parameters, and PNG or SVG views
-
-## Installation
-
-### Prerequisites
-
-CadQuery must be installed first. The recommended method is via conda:
-
-```bash
-conda install -c conda-forge cadquery
+```sh
+uv sync --locked
+uv run --locked cadquery-mcp --toolset evaluate-file
 ```
 
-### Install from Source
+PNG rendering requires ImageMagick (`magick` or `convert`) on `PATH`; SVG needs
+no raster converter. CadQuery and the MCP SDK are locked Python dependencies.
+Run the regression suite with `uv run --locked pytest -q`; pytest is included
+in the development dependency group. No printer is contacted by this server.
 
-```bash
-git clone https://github.com/CadQuery/cadquery-contrib.git
-cd cadquery-contrib/mcp-server
-pip install .
-```
+Configure an MCP client to launch the installed `cadquery-mcp` command with
+`["--toolset", "evaluate-file"]`. Use the full path to the environment's command
+when it is not on the client's PATH, or launch through `uv --directory` with the
+absolute `mcp-server` directory. Omit `--toolset evaluate-file` for all five tools.
+Restart an already-running server after updating: it cannot advertise new
+arguments or change its loaded implementation until restarted.
 
-For development (editable install):
-
-```bash
-pip install -e .
-```
-
-### Run Tests
-
-```bash
-pip install pytest
-pytest test_cadquery_mcp_server.py -v
-```
-
-## Configuration
-
-### Claude Code
-
-Add to your `~/.claude/settings.json`:
+## File evaluation
 
 ```json
 {
-    "mcpServers": {
-        "cadquery": {
-            "command": "cadquery-mcp"
-        }
-    }
+  "file_path": "/absolute/project/model/jar/jar.py",
+  "views": ["isometric", "front", "top", "right"],
+  "output_dir": "renders/print",
+  "exports": [
+    {"path": "jar.step", "format": "STEP"},
+    {"path": "jar.stl", "format": "STL", "tolerance": 0.02, "angular_tolerance": 0.1}
+  ]
 }
 ```
 
-### Claude Desktop
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `file_path` | required | Source file; relative input paths use the server launch directory. |
+| `views` | isometric, front, top, right | Known view names; `[]` skips rendering. Also back, bottom, left, isometric_back. |
+| `width`, `height` | 800, 600 | Image dimensions, each 1–4096 pixels. |
+| `show_hidden` | false | Include hidden edges when useful for inspection. |
+| `image_format` | png | `png` or `svg`. |
+| `output_dir` | omitted | Save images here instead of returning inline images. |
+| `exports` | [] | STEP/STL exports from the same selected geometry and placement. |
+| `timeout_seconds` | 300 | Positive total worker timeout, including startup, build, exports and views. |
 
-Add to your Claude Desktop configuration (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+Each export requires `path` and `format` (`STEP` or `STL`). The file extension
+must match. STL tessellation uses optional positive `tolerance` (default 0.02 mm)
+and `angular_tolerance` (default 0.1 radians). Relative export/output paths resolve
+against the model directory; absolute paths are accepted. Existing matching
+outputs are replaced only after that individual output succeeds. A group of
+exports is not a transaction: inspect each status after a partial failure.
 
-```json
-{
-    "mcpServers": {
-        "cadquery": {
-            "command": "cadquery-mcp"
-        }
-    }
-}
-```
+Arguments are checked before executing the source. The server assumes model
+coordinates are millimetres; it does not detect or convert a script's intended
+units. It does not rearrange, scale, union or repair the selected geometry.
 
-**Note:** If using conda, you may need to specify the full path:
-
-```json
-{
-    "mcpServers": {
-        "cadquery": {
-            "command": "/path/to/conda/envs/yourenv/bin/cadquery-mcp"
-        }
-    }
-}
-```
-
-### File-based evaluation
-
-For an agent workflow where the model file is edited between evaluations, run the reduced toolset:
-
-```bash
-cadquery-mcp --toolset evaluate-file
-```
-
-```text
-models/bracket.py
-        ↓
-evaluate_file
-        ↓
-geometry + parameters + PNG/SVG views
-        ↓
-edit bracket.py
-        ↓
-evaluate again
-```
-
-Example MCP configuration:
-
-```json
-{
-    "mcpServers": {
-        "cadquery": {
-            "command": "cadquery-mcp",
-            "args": ["--toolset", "evaluate-file"]
-        }
-    }
-}
-```
-
-PNG is the default image format for reliable model vision. PNG conversion requires ImageMagick (`magick` or `convert`) on `PATH`; use `image_format: "svg"` when SVG output is preferred. If `output_dir` is provided to `evaluate_file`, the requested images are saved there and the tool returns their paths in the text summary instead of inline image content.
-
-## Usage Examples
-
-Once configured, you can ask Claude to create 3D models:
-
-> "Create a box with a hole through it"
-
-Claude will execute:
+## Script contract
 
 ```python
+from pathlib import Path
 import cadquery as cq
+from parameters import WIDTH  # sibling source is fresh on every evaluation
 
-result = (
-    cq.Workplane('XY')
-    .box(20, 20, 10)
-    .faces('>Z')
-    .workplane()
-    .hole(5)
-)
+HERE = Path(__file__).resolve().parent
+result = cq.Workplane("XY").box(WIDTH, 20, 5)
 ```
 
-And return a rendered SVG image of the model.
+The worker defines absolute `__file__`, uses the model directory as its working
+directory and prepends it to the Python import path. CQGI's `__name__` remains
+`__cqgi__`; put the model at top level rather than under a `__main__` guard.
+A fresh process and isolated bytecode lookup prevent stale local imports,
+including same-size edits with unchanged timestamps. Worker path/global changes
+do not leak into later evaluations or the MCP server.
 
-### Multi-View Rendering
+A non-None `result` explicitly selects the output and takes precedence over
+`show_object()` calls. It may be a Shape, Workplane, Assembly, or list/tuple of
+those. All Workplane items are included. Without `result`, all `show_object()`
+outputs are combined. Multiple shapes form a compound without boolean union;
+identical top-level shape objects are deduplicated. Keep display/reference
+geometry out of the selected printable result. Unsupported values produce an
+error rather than silently dropping geometry.
 
-For complex models, request multiple views:
+The file is trusted Python code with the server user's permissions. Process
+isolation prevents state leakage and permits cancellation; it is not a security
+sandbox. A script may have its own file-writing side effects; those cannot be
+rolled back after an error or timeout. Python stdout/stderr are captured up to
+16 KiB and returned as diagnostics. Native/subprocess output is discarded in
+file workers so it cannot corrupt MCP's standard-output transport.
 
-> "Show me this bracket from multiple angles"
+## Results and failures
 
-The server will return isometric, front, top, and right views.
+The MCP response contains a concise text summary and `structuredContent`:
 
-### Parametric Models
+- `ok`, `errors`: explicit success and stage/type/message/source-line/traceback.
+  Failures set the MCP `isError` flag, including partial export/render failures.
+- `geometry`: validity, precise B-rep bounds, sizes, volume, area, centre of mass,
+  topology and per-solid measurements. Bounds do not depend on render meshes.
+- `parameters`: CQGI parameters from the evaluated entry point; this does not
+  automatically extract parameters from imported modules.
+- `source_sha256`, `local_module_sha256`, `versions`: source and imported local
+  Python-module hashes, Python/CadQuery/OCP/server versions. Arbitrary data files
+  read by the script are not tracked; record those dependencies separately.
+- `exports`, `views`: each requested artifact's status, successful paths and
+  export hashes. Inline images are returned when no output directory is requested.
+- `diagnostics`, `timings_seconds`: captured Python output and stage timings.
 
-CadQuery scripts can define parameters:
+Geometry is measured before export/rendering and invalid geometry is flagged.
+A render failure preserves geometry, parameters, successful exports and other
+views. A failed output may leave an older file at that path: only a successful
+status identifies a current artifact. Timeouts stop the worker (and its process
+group on POSIX) and report an error; timeout/crash responses cannot promise
+partial geometry results. Later evaluations can continue normally.
 
-```python
-height = 10.0  # Height of the box
-width = 20.0   # Width of the box
-depth = 5.0    # Depth of the box
+Export success, validity and matching bounds are not printability or physical-fit
+certification. Independently check the actual STEP/STL pair and slice the final
+print placement as required by the consuming project.
 
-import cadquery as cq
-result = cq.Workplane('XY').box(width, height, depth)
-```
+## Legacy tools
 
-Use the `get_parameters` tool to extract these for modification.
+The full toolset also accepts inline Python through `code`:
 
-### Exporting Models
+| Tool | Additional arguments | Result |
+| --- | --- | --- |
+| `render` | `view`, `multi_view`, `width`, `height`, `show_hidden` | SVG image(s); hidden lines default true for compatibility. |
+| `inspect` | none | Geometry summary. |
+| `get_parameters` | none | CQGI parameter metadata. |
+| `export` | `filename`, optional `format` | One export; format inferred from filename when omitted. |
 
-Export to STEP for manufacturing or STL for 3D printing:
-
-> "Export this model as a STEP file to ~/models/bracket.step"
-
-## API Reference
-
-### render
-
-Execute CadQuery code and return rendered image(s).
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| code | string | required | CadQuery Python code to execute |
-| view | string | "isometric" | Camera angle (isometric, front, back, top, bottom, left, right, isometric_back) |
-| multi_view | boolean | false | Return multiple views |
-| width | integer | 800 | Image width in pixels |
-| height | integer | 600 | Image height in pixels |
-| show_hidden | boolean | true | Show hidden lines |
-
-### inspect
-
-Get geometry information about the resulting shape.
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| code | string | required | CadQuery Python code to execute |
-
-### get_parameters
-
-Extract customizable parameters from a script.
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| code | string | required | CadQuery Python code to parse |
-
-### export
-
-Export the model to a file.
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| code | string | required | CadQuery Python code to execute |
-| filename | string | required | Output filename |
-| format | string | auto | Export format (STEP, STL, SVG, DXF, AMF, 3MF, VRML, BREP) |
-
-### evaluate_file
-
-Build a CadQuery Python file once and return a text summary followed by one PNG or SVG image per requested view. When `output_dir` is provided, save the images there and return their paths instead.
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| file_path | string | required | Path to the CadQuery Python source file |
-| views | array of strings | isometric, front, top, right | Views to render |
-| width | integer | 800 | Image width in pixels |
-| height | integer | 600 | Image height in pixels |
-| show_hidden | boolean | true | Show hidden lines |
-| image_format | string | png | Image format: png or svg |
-| output_dir | string | omitted | Optional directory for saved images; suppresses inline image content |
-
-## Writing CadQuery Scripts for MCP
-
-Scripts should either:
-
-1. Assign the final shape to a variable named `result`:
-   ```python
-   result = cq.Workplane('XY').box(1, 2, 3)
-   ```
-
-2. Use `show_object()` to output shapes:
-   ```python
-   box = cq.Workplane('XY').box(1, 2, 3)
-   show_object(box)
-   ```
+Legacy inline execution remains in-process and does not provide file-worker
+isolation or timeout guarantees. Prefer `evaluate_file` for repository work.
+All tools report protocol errors explicitly. Python prints from legacy calls
+are captured by the protocol handler; legacy native output is not intercepted.
 
 ## License
 
-Apache License 2.0 - see [LICENSE](../LICENSE) for details.
-
-## Contributing
-
-Contributions are welcome! Please see the [cadquery-contrib](https://github.com/CadQuery/cadquery-contrib) repository for guidelines.
+Apache License 2.0; see the repository [LICENSE](../LICENSE).

@@ -477,28 +477,18 @@ depth = 5.0
 import cadquery as cq
 result = cq.Workplane("XY").box(width, height, depth)
 """)
-        build_count = 0
-        original_parse = cadquery_mcp_server.cqgi.parse
-
-        def parse_once(source):
-            model = original_parse(source)
-            original_build = model.build
-
-            def build_once():
-                nonlocal build_count
-                build_count += 1
-                return original_build()
-
-            model.build = build_once
-            return model
-
-        monkeypatch.setattr(cadquery_mcp_server.cqgi, "parse", parse_once)
+        # Observe execution in the worker rather than monkeypatching the parent.
+        counter = filename + ".count"
+        with open(filename, "a") as source:
+            source.write(f"\nwith open({counter!r}, 'a') as counter: counter.write('built\\n')\n")
         try:
             result = asyncio.run(_handle_evaluate_file({"file_path": filename}))
         finally:
             os.unlink(filename)
 
-        assert build_count == 1
+        with open(counter) as record:
+            assert record.read() == "built\n"
+        os.unlink(counter)
         assert len(result) == 5
         assert result[0].type == "text"
 

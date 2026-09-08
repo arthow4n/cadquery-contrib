@@ -38,6 +38,11 @@ Configuration in Claude Code (~/.claude/settings.json):
 import argparse
 import asyncio
 import base64
+import json
+import sys
+import os
+import signal
+import time
 import shutil
 import subprocess
 import tempfile
@@ -191,13 +196,23 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="evaluate_file",
             description=(
-                "Read, build, and evaluate a CadQuery Python file once. Returns geometry information, "
-                "parameters, and PNG or SVG renders for the requested views. PNG is returned by default; "
-                "provide output_dir to save the rendered files there instead of returning image content."
+                "Evaluate a CadQuery file once in a fresh worker with __file__ and sibling imports. "
+                "Returns geometry validity, measurements, parameters, diagnostics and per-artifact status. "
+                "Optional exports write STEP/STL from the same build. PNG views are inline by default; "
+                "output_dir saves them instead and views=[] skips rendering. Partial failures preserve "
+                "successful results and set isError. Relative output paths use the model directory."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "timeout_seconds": {"type": "number", "exclusiveMinimum": 0, "default": 300,
+                                        "description": "Total worker timeout including build, exports and rendering"},
+                    "exports": {"type": "array", "default": [], "description": "Optional STEP/STL exports from the same evaluated shape; relative paths use the model directory",
+                        "items": {"type": "object", "additionalProperties": False,
+                            "properties": {"path": {"type": "string"}, "format": {"type": "string", "enum": ["STEP", "STL"]},
+                                "tolerance": {"type": "number", "exclusiveMinimum": 0, "default": 0.02},
+                                "angular_tolerance": {"type": "number", "exclusiveMinimum": 0, "default": 0.1}},
+                            "required": ["path", "format"]}},
                     "file_path": {
                         "type": "string",
                         "description": "Path to the CadQuery Python source file",
@@ -214,16 +229,18 @@ async def list_tools() -> list[Tool]:
                     "width": {
                         "type": "integer",
                         "default": 800,
+                        "minimum": 1, "maximum": 4096,
                         "description": "Image width in pixels",
                     },
                     "height": {
                         "type": "integer",
                         "default": 600,
+                        "minimum": 1, "maximum": 4096,
                         "description": "Image height in pixels",
                     },
                     "show_hidden": {
                         "type": "boolean",
-                        "default": True,
+                        "default": False,
                         "description": "Whether to show hidden lines",
                     },
                     "image_format": {
@@ -252,17 +269,67 @@ async def _list_tools_handler(_context, _params) -> ListToolsResult:
     return ListToolsResult(tools=await list_tools())
 
 
+class ToolResponse(list):
+    """List-compatible internal response with explicit protocol metadata."""
+
+    def __init__(self, content=(), *, error=False, data=None):
+        super().__init__(content)
+        self.error = error
+        self.data = data
+
+
+def _error(message, stage="request", error_type=None):
+    return ToolResponse([TextContent(type="text", text=message)], error=True,
+                        data={"ok": False, "errors": [{"stage": stage, "type": error_type or stage.title() + "Error", "message": message}]})
+
+
 def _extract_shape(build_result, env):
-    """Extract the shape from a build result or environment."""
-    # First try to get from show_object() calls
-    if build_result.first_result is not None:
-        return build_result.first_result.shape
+    """Explicit result wins; otherwise combine every show_object output."""
+    selected = env.get("result")
+    if selected is None:
+        selected = [item.shape for item in build_result.results]
+    shapes = []
 
-    # Fall back to 'result' variable in environment
-    if "result" in env:
-        return env["result"]
+    def collect(value):
+        if isinstance(value, cq.Workplane):
+            for item in value.vals():
+                collect(item)
+        elif isinstance(value, cq.Assembly):
+            collect(value.toCompound())
+        elif isinstance(value, cq.Shape):
+            if not any(value.isSame(previous) for previous in shapes):
+                shapes.append(value)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                collect(item)
+        elif value is not None:
+            raise TypeError(f"Expected a CadQuery shape, Workplane or Assembly, got {type(value).__name__}")
 
-    return None
+    collect(selected)
+    if not shapes:
+        return None
+    return shapes[0] if len(shapes) == 1 else cq.Compound.makeCompound(shapes)
+
+
+def _geometry_data(shape):
+    """B-rep bounds independent of cached triangulation; model units are mm."""
+    from OCP.Bnd import Bnd_Box
+    from OCP.BRepBndLib import BRepBndLib
+
+    def measure(item):
+        box = Bnd_Box()
+        BRepBndLib.AddOptimal_s(item.wrapped, box, False, False)
+        bounds = list(box.Get())
+        return {"valid": item.isValid(), "bounds_mm": bounds,
+                "size_mm": [bounds[i + 3] - bounds[i] for i in range(3)],
+                "volume_mm3": item.Volume(), "surface_area_mm2": item.Area(),
+                "center_of_mass_mm": list(item.Center().toTuple())}
+
+    data = measure(shape)
+    data["topology"] = {name: len(getattr(shape, method)()) for name, method in
+                        (("solids", "Solids"), ("faces", "Faces"), ("edges", "Edges"), ("vertices", "Vertices"))}
+    data["components"] = [measure(solid) for solid in shape.Solids()]
+    return data
 
 
 def _render_svg(shape, view_name: str, width: int, height: int, show_hidden: bool = True) -> str:
@@ -317,47 +384,18 @@ def _render_image(
     raise ValueError(f"Unsupported image format: {image_format}")
 
 
-def _geometry_summary(shape, build_time: float) -> str:
-    """Return the geometry information shared by inspect and evaluate_file."""
-    bb = shape.BoundingBox()
-    info_lines = [
-        "Geometry Information:",
-        "  Bounding Box:",
-        f"    X: {bb.xmin:.4f} to {bb.xmax:.4f} (size: {bb.xlen:.4f})",
-        f"    Y: {bb.ymin:.4f} to {bb.ymax:.4f} (size: {bb.ylen:.4f})",
-        f"    Z: {bb.zmin:.4f} to {bb.zmax:.4f} (size: {bb.zlen:.4f})",
-    ]
-
-    try:
-        info_lines.append(f"  Volume: {shape.Volume():.4f}")
-    except Exception:
-        pass
-
-    try:
-        info_lines.append(f"  Surface Area: {shape.Area():.4f}")
-    except Exception:
-        pass
-
-    try:
-        center = shape.Center()
-        info_lines.append(f"  Center of Mass: ({center.x:.4f}, {center.y:.4f}, {center.z:.4f})")
-    except Exception:
-        pass
-
-    info_lines.append("  Topology:")
-    for name, method in (
-        ("Solids", shape.Solids),
-        ("Faces", shape.Faces),
-        ("Edges", shape.Edges),
-        ("Vertices", shape.Vertices),
-    ):
-        try:
-            info_lines.append(f"    {name}: {len(method())}")
-        except Exception:
-            pass
-
-    info_lines.append(f"  Build Time: {build_time:.4f}s")
-    return "\n".join(info_lines)
+def _geometry_summary(shape, build_time: float, data=None) -> str:
+    data = _geometry_data(shape) if data is None else data
+    bounds = data["bounds_mm"]
+    lines = ["Geometry Information:", "  Units: mm", f"  Valid: {data['valid']}", "  Bounding Box:"]
+    for i, axis in enumerate("XYZ"):
+        lines.append(f"    {axis}: {bounds[i]:.4f} to {bounds[i+3]:.4f} (size: {data['size_mm'][i]:.4f})")
+    lines.extend([f"  Volume: {data['volume_mm3']:.4f}", f"  Surface Area: {data['surface_area_mm2']:.4f}",
+                  "  Center of Mass: (" + ", ".join(f"{v:.4f}" for v in data["center_of_mass_mm"]) + ")",
+                  "  Topology:"])
+    lines.extend(f"    {key.title()}: {value}" for key, value in data["topology"].items())
+    lines.append(f"  Build Time: {build_time:.4f}s")
+    return "\n".join(lines)
 
 
 def _parameter_summary(params, heading: str = "Parameters found:") -> str:
@@ -380,7 +418,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
     """Handle tool calls."""
 
     if _TOOLSET == "evaluate-file" and name != "evaluate_file":
-        return [TextContent(type="text", text=f"Tool not enabled in the current toolset: {name}")]
+        return _error(f"Tool not enabled in the current toolset: {name}")
 
     if name == "render":
         return await _handle_render(arguments)
@@ -393,13 +431,29 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
     elif name == "evaluate_file":
         return await _handle_evaluate_file(arguments)
     else:
-        return [TextContent(type="text", text=f"Unknown tool: {name}")]
+        return _error(f"Unknown tool: {name}")
 
 
 async def _call_tool_handler(_context, params: CallToolRequestParams):
     """Adapt the public tool caller to the low-level MCP server API."""
-    content = await call_tool(params.name, params.arguments or {})
-    return CallToolResult(content=content)
+    from contextlib import redirect_stdout, redirect_stderr
+    from cadquery_evaluation import BoundedLog
+    log = BoundedLog()
+    try:
+        if params.name == "evaluate_file":
+            content = await call_tool(params.name, params.arguments or {})
+        else:
+            # Legacy handlers are synchronous internally, so this context does
+            # not span an event-loop yield. File evaluations capture in workers.
+            with redirect_stdout(log), redirect_stderr(log):
+                content = await call_tool(params.name, params.arguments or {})
+    except Exception as exc:
+        content = _error(f"{type(exc).__name__}: {exc}")
+    if log.getvalue():
+        content.append(TextContent(type="text", text="Script output:\n" + log.getvalue()))
+    return CallToolResult(content=list(content), isError=getattr(content, "error", False),
+                          structuredContent=getattr(content, "data", None))
+
 
 
 server = Server(
@@ -424,18 +478,12 @@ async def _handle_render(arguments: dict[str, Any]) -> list[TextContent | ImageC
         result = model.build()
 
         if result.exception:
-            return [TextContent(
-                type="text",
-                text=f"Execution error:\n{traceback.format_exception(type(result.exception), result.exception, result.exception.__traceback__)}"
-            )]
+            return _error(f"Execution error:\n{traceback.format_exception(type(result.exception), result.exception, result.exception.__traceback__)}")
 
         shape = _extract_shape(result, result.env)
 
         if shape is None:
-            return [TextContent(
-                type="text",
-                text="No shape produced. Use show_object(shape) or assign to 'result' variable."
-            )]
+            return _error("No shape produced. Use show_object(shape) or assign to 'result' variable.")
 
         # Get the underlying Shape object if it's a Workplane
         if hasattr(shape, "val"):
@@ -464,9 +512,9 @@ async def _handle_render(arguments: dict[str, Any]) -> list[TextContent | ImageC
             return [_CadQueryImageContent(type="image", data=svg_data, mimeType="image/svg+xml")]
 
     except SyntaxError as e:
-        return [TextContent(type="text", text=f"Syntax error: {e}")]
+        return _error(f"Syntax error: {e}")
     except Exception as e:
-        return [TextContent(type="text", text=f"Error: {type(e).__name__}: {e}")]
+        return _error(f"Error: {type(e).__name__}: {e}")
 
 
 async def _handle_inspect(arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
@@ -478,18 +526,12 @@ async def _handle_inspect(arguments: dict[str, Any]) -> list[TextContent | Image
         result = model.build()
 
         if result.exception:
-            return [TextContent(
-                type="text",
-                text=f"Execution error: {result.exception}"
-            )]
+            return _error(f"Execution error: {result.exception}")
 
         shape = _extract_shape(result, result.env)
 
         if shape is None:
-            return [TextContent(
-                type="text",
-                text="No shape produced. Use show_object(shape) or assign to 'result' variable."
-            )]
+            return _error("No shape produced. Use show_object(shape) or assign to 'result' variable.")
 
         # Get the underlying Shape object if it's a Workplane
         if hasattr(shape, "val"):
@@ -498,7 +540,7 @@ async def _handle_inspect(arguments: dict[str, Any]) -> list[TextContent | Image
         return [TextContent(type="text", text=_geometry_summary(shape, result.buildTime))]
 
     except Exception as e:
-        return [TextContent(type="text", text=f"Error: {type(e).__name__}: {e}")]
+        return _error(f"Error: {type(e).__name__}: {e}")
 
 
 async def _handle_get_parameters(arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
@@ -515,113 +557,63 @@ async def _handle_get_parameters(arguments: dict[str, Any]) -> list[TextContent 
         return [TextContent(type="text", text=_parameter_summary(params))]
 
     except SyntaxError as e:
-        return [TextContent(type="text", text=f"Syntax error: {e}")]
+        return _error(f"Syntax error: {e}")
     except Exception as e:
-        return [TextContent(type="text", text=f"Error: {type(e).__name__}: {e}")]
+        return _error(f"Error: {type(e).__name__}: {e}")
 
 
 async def _handle_evaluate_file(arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
-    """Build a CadQuery file once and return its geometry, parameters, and views."""
-    file_path = arguments.get("file_path")
-    if not isinstance(file_path, str) or not file_path:
-        return [TextContent(type="text", text="File path is required.")]
-
+    """Run each file in a fresh process; model output never enters MCP stdout."""
+    from cadquery_evaluation import validate_arguments
     try:
-        with open(file_path, encoding="utf-8") as source_file:
-            code = source_file.read()
-    except FileNotFoundError:
-        return [TextContent(type="text", text=f"File not found: {file_path}")]
-    except (OSError, UnicodeError) as e:
-        return [TextContent(type="text", text=f"Unable to read file '{file_path}': {e}")]
-
-    try:
-        model = cqgi.parse(code)
-    except SyntaxError as e:
-        return [TextContent(type="text", text=f"Syntax error in '{file_path}': {e}")]
-    except Exception as e:
-        return [TextContent(type="text", text=f"Unable to parse '{file_path}': {type(e).__name__}: {e}")]
-
-    try:
-        result = model.build()
-    except Exception as e:
-        return [TextContent(type="text", text=f"Build failed for '{file_path}': {type(e).__name__}: {e}")]
-
-    if result.exception:
-        return [TextContent(type="text", text=f"Build failed for '{file_path}': {result.exception}")]
-
-    shape = _extract_shape(result, getattr(result, "env", {}))
-    if shape is None:
-        return [TextContent(
-            type="text",
-            text=f"No shape produced by '{file_path}'. Use show_object(shape) or assign to 'result'.",
-        )]
-
-    if hasattr(shape, "val"):
-        shape = shape.val()
-
-    views = arguments.get("views", list(_EVALUATE_FILE_DEFAULT_VIEWS))
-    if views is None:
-        views = []
-    if not isinstance(views, list) or not all(isinstance(view, str) for view in views):
-        return [TextContent(type="text", text="views must be an array of view names.")]
-
-    image_format = arguments.get("image_format", "png")
-    if image_format not in ("png", "svg"):
-        return [TextContent(type="text", text="image_format must be 'png' or 'svg'.")]
-
-    output_dir = arguments.get("output_dir")
-    if output_dir is not None and (not isinstance(output_dir, str) or not output_dir):
-        return [TextContent(type="text", text="output_dir must be a non-empty directory path.")]
-
-    rendered_views = []
-    try:
-        for view_name in views:
-            image_data, mime_type = _render_image(
-                shape,
-                view_name,
-                arguments.get("width", 800),
-                arguments.get("height", 600),
-                arguments.get("show_hidden", True),
-                image_format,
-            )
-            rendered_views.append((view_name, image_data, mime_type))
-    except Exception as e:
-        return [TextContent(
-            type="text",
-            text=f"Unable to render view '{view_name}' for '{file_path}': {type(e).__name__}: {e}",
-        )]
-
-    summary = "\n\n".join((
-        f"File: {file_path}",
-        _geometry_summary(shape, result.buildTime),
-        _parameter_summary(model.metadata.parameters, heading="Parameters:"),
-        f"Rendered views ({image_format}): {', '.join(views) if views else 'none'}",
-    ))
-
-    if output_dir is not None:
-        output_path = Path(output_dir)
-        try:
-            output_path.mkdir(parents=True, exist_ok=True)
-            saved_paths = []
-            stem = Path(file_path).stem or "model"
-            for view_name, image_data, _mime_type in rendered_views:
-                saved_path = output_path / f"{stem}_{view_name}.{image_format}"
-                saved_path.write_bytes(image_data)
-                saved_paths.append(str(saved_path))
-        except OSError as e:
-            return [TextContent(type="text", text=f"Unable to save views to '{output_dir}': {e}")]
-
-        saved_summary = "Saved views:\n" + (
-            "\n".join(f"  {path}" for path in saved_paths) if saved_paths else "  none"
+        args = validate_arguments(arguments)
+    except (ValueError, TypeError) as exc:
+        return _error(str(exc), "validation", type(exc).__name__)
+    request_started = time.monotonic()
+    with tempfile.TemporaryDirectory(prefix="cadquery-evaluate-") as directory:
+        request_path = Path(directory) / "request.json"
+        response_path = Path(directory) / "response.json"
+        request_path.write_text(json.dumps(args), encoding="utf-8")
+        worker = Path(__file__).with_name("cadquery_evaluation.py")
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, str(worker), str(request_path), str(response_path),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=(os.name == "posix"),
         )
-        return [TextContent(type="text", text=f"{summary}\n\n{saved_summary}")]
 
-    results: list[TextContent | ImageContent] = [TextContent(type="text", text=summary)]
-    for _view_name, image_data, mime_type in rendered_views:
-        image_data_base64 = base64.standard_b64encode(image_data).decode("utf-8")
-        results.append(_CadQueryImageContent(type="image", data=image_data_base64, mimeType=mime_type))
+        async def stop():
+            if process.returncode is None:
+                try:
+                    if os.name == "posix":
+                        os.killpg(process.pid, signal.SIGKILL)
+                    else:
+                        process.kill()
+                except ProcessLookupError:
+                    pass
+            await process.wait()
 
-    return results
+        try:
+            await asyncio.wait_for(process.wait(), args["timeout_seconds"])
+        except asyncio.TimeoutError:
+            await stop()
+            return _error(f"Evaluation timed out after {args['timeout_seconds']} seconds; worker stopped. "
+                          "Files written by the script before timeout may remain.", "timeout")
+        except asyncio.CancelledError:
+            await stop()
+            raise
+        if process.returncode != 0 or not response_path.is_file():
+            return _error(f"Evaluation worker exited without a result (exit {process.returncode}).", "worker")
+        try:
+            payload = json.loads(response_path.read_text(encoding="utf-8"))
+            timings = payload["data"]["timings_seconds"]
+            timings["worker"] = timings.pop("total")
+            timings["total"] = time.monotonic() - request_started
+            payload["content"][0]["text"] += f"\nTotal request time: {timings['total']:.4f}s (including worker startup)"
+            content = [TextContent(**item) if item["type"] == "text" else _CadQueryImageContent(**item)
+                       for item in payload["content"]]
+            return ToolResponse(content, error=payload["error"], data=payload["data"])
+        except (ValueError, KeyError, TypeError) as exc:
+            return _error(f"Invalid worker response: {exc}", "worker")
 
 
 async def _handle_export(arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
@@ -635,18 +627,12 @@ async def _handle_export(arguments: dict[str, Any]) -> list[TextContent | ImageC
         result = model.build()
 
         if result.exception:
-            return [TextContent(
-                type="text",
-                text=f"Execution error: {result.exception}"
-            )]
+            return _error(f"Execution error: {result.exception}")
 
         shape = _extract_shape(result, result.env)
 
         if shape is None:
-            return [TextContent(
-                type="text",
-                text="No shape produced. Use show_object(shape) or assign to 'result' variable."
-            )]
+            return _error("No shape produced. Use show_object(shape) or assign to 'result' variable.")
 
         # Get the underlying Shape if it's a Workplane
         if hasattr(shape, "val"):
@@ -658,7 +644,7 @@ async def _handle_export(arguments: dict[str, Any]) -> list[TextContent | ImageC
         return [TextContent(type="text", text=f"Exported to: {filename}")]
 
     except Exception as e:
-        return [TextContent(type="text", text=f"Error: {type(e).__name__}: {e}")]
+        return _error(f"Error: {type(e).__name__}: {e}")
 
 
 async def main():
